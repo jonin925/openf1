@@ -1,28 +1,46 @@
 import asyncio
+from app.services.db import get_pool
+from app.services.calendar_service import CalendarService
 from app.services.openf1_client import OpenF1Client
-from app.services.data_store import store
 
-client = OpenF1Client()
+async def ingest_full_year(year: int = 2025):
+    pool = await get_pool()
+    calendar = CalendarService(pool)
+    client = OpenF1Client()
 
-async def preload_2025():
-    sessions = await client.get_sessions_2025()
-    store.sessions = sessions
+    # Step 1: populate races + sessions
+    await calendar.ingest_year(year)
 
-    # Filter only race sessions (more reliable telemetry availability)
-    race_sessions = [s for s in sessions if s.get("session_name", "").lower() == "race"]
+    # Step 2: fetch all session keys
+    async with pool.acquire() as conn:
+        session_rows = await conn.fetch("SELECT session_key FROM sessions")
 
-    if not race_sessions:
-        print("No race sessions found for 2025")
-        return
+    # Step 3: ingest telemetry per session
+    for row in session_rows:
+        sk = row["session_key"]
+        telemetry = await client.fetch("location", {"session_key": sk})
 
-    first_race_key = race_sessions[0]["session_key"]
-    print(f"Using race session_key={first_race_key}")
+        async with pool.acquire() as conn:
+            await conn.executemany("""
+                INSERT INTO telemetry (
+                    time, session_key, driver_number,
+                    x, y, speed
+                )
+                VALUES ($1,$2,$3,$4,$5,$6)
+                ON CONFLICT DO NOTHING
+            """, [
+                (
+                    t["date"],
+                    sk,
+                    t["driver_number"],
+                    t.get("x"),
+                    t.get("y"),
+                    t.get("speed"),
+                )
+                for t in telemetry
+            ])
 
-    store.laps[first_race_key] = await client.get_laps(first_race_key)
-    store.positions[first_race_key] = await client.get_positions(first_race_key)
-    store.telemetry[first_race_key] = await client.get_telemetry(first_race_key)
-
-    print("Preload complete")
+    await pool.close()
 
 if __name__ == "__main__":
-    asyncio.run(preload_2025())
+    asyncio.run(ingest_full_year(2025))

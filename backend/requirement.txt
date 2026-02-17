@@ -6,3 +6,4 @@ asyncpg
 sqlalchemy
 redis
 apscheduler
+pydantic_settings
